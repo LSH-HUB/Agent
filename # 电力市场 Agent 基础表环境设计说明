@@ -1,0 +1,1178 @@
+# 电力市场 Agent 基础表环境设计说明
+
+核查日期：2026-07-12
+
+## 0. 客户问题查询业务清单
+
+本次读取 `sql/客户提问问题list.xlsx`，共识别 25 条非空客户问题。问题不是单纯的“查数”，而是围绕现货交易、价格风险、负荷和新能源、阻塞、预测模型、用户偏差、规则解释等场景提出。信息解释类问题由 RAG 模块承接，本设计主要判断结构化基础业务环境是否能支撑查询、统计、对比和辅助研判。
+
+| 查询业务 | 业务背景 | 客户问题示例 | 基础表覆盖情况 | 主要依赖 |
+|---|---|---|---|---|
+| 现货价格行情与交易动作辅助 | 交易人员需要判断实时价格、日前预测价格和后续负荷变化，辅助对冲、锁仓、平仓等操作 | 实时价格上涨且后 4 小时负荷上升，是否立刻买入现货对冲 | 可覆盖行情和风险提示，不直接给确定交易指令 | `pm_{region_code}_price_curve`、`pm_{region_code}_load_curve`、`pm_{region_code}_boundary_curve` |
+| 日前/实时价差与套利机会 | 日前成交价和实时价格经常产生价差，业务需要判断价差是否稳定、风险收益如何 | 日前价格 0.48、实时价格 0.42，是否改买实时电 | 可覆盖价差计算、历史分布、极值时段和趋势 | `pm_{region_code}_price_spread_curve`、`pm_{region_code}_price_curve` |
+| 行情一致性与数据延迟校验 | 业务系统展示价与市场真实价不一致时，需要确认应采用哪个价格口径 | 滚动交易模块显示的实时均价比实际价格滞后 | 可覆盖市场基准价查询；系统延迟定位需平台日志，暂不进基础库 | `pm_{region_code}_price_curve`、`pm_import_batch` |
+| 负荷、竞价空间与价格高位归因 | 高价并不只由负荷决定，还可能与新能源、联络线、固定出力、非市场机组等共同相关 | 气温下降、负荷下降预期下，为什么价格仍高 | 可覆盖基于指标证据的辅助研判 | `pm_{region_code}_load_curve`、`pm_{region_code}_generation_output_curve`、`pm_{region_code}_boundary_curve`、`pm_metric_formula` |
+| 新能源出力与价格影响 | 风电、光伏预测偏差会影响竞价空间和现货价格 | 风电出力骤降但价格只涨 8%，是否反应不足 | 可覆盖出力、预测/实际偏差、价格联动；天气原因走外部工具或 RAG | `pm_{region_code}_generation_output_curve`、`pm_{region_code}_price_curve` |
+| 预测模型误差与稳定性评估 | 业务希望知道价格、风电、负荷预测模型在不同市场条件下是否失效 | 价格预测模型过去一年误差分布如何 | 可覆盖预测值和实际值对比；模型解释本身由模型评估/RAG 承接 | `pm_{region_code}_price_curve`、`pm_{region_code}_generation_output_curve`、`pm_{region_code}_load_curve` |
+| 输电断面阻塞与区域价格分化 | 阻塞会导致分区电价差异，影响交易和结算理解 | 哪些断面容易阻塞，阻塞如何导致区域电价分化 | 可部分覆盖；需建设断面表后才能完整回答断面频率和潮流归因 | `pm_{region_code}_interface_flow_curve`、`pm_{region_code}_price_curve` |
+| 开机容量和机组状态分析 | 开机容量、检修、固定出力会影响供给侧弹性和价格水平 | 近一个月开机容量是多少，和价格变化是否相关 | 可选覆盖；作为 P1/P2 扩展表 | `pm_{region_code}_unit_status_curve`、`pm_{region_code}_price_curve` |
+| 报价行为与市场主体异常 | 发电集团或售电公司报价异常可能影响市场预期，但涉及主体和申报敏感数据 | 某发电集团连续 3 天高价申报是否拉高预期 | 基础公有行情库不覆盖；可用脱敏申报表作为后续扩展 | 后续脱敏报价/申报表 |
+| 用户用电画像与偏差考核 | 售电侧需要识别用户负荷特征、偏差风险和重点时段 | 偏差考核风险主要来自哪些用户/哪些时段 | 涉及用户私有数据，暂不进入基础公有环境 | 后续脱敏用户负荷和偏差表 |
+| 结算、阻塞盈余和申诉解释 | 结算单费用项需要结合规则、合同和结算数据解释 | 阻塞盈余分摊扣费能否申诉 | 信息解释走 RAG；结算账单属于敏感扩展数据 | RAG、后续结算表 |
+| 政策规则和模型解释类问答 | 客户关心规则变动、出清机制、模型解释和特征选择 | 最新政策/规则变动是什么 | 暂不进基础表，由 RAG 模块承接 | RAG 知识库 |
+
+## 0.1 电力现货市场整体业务逻辑
+
+电力市场可以简单理解为：在每一个时间点，系统都要让“用多少电”和“发多少电”尽量平衡，并用市场价格反映当时供需是否紧张。
+
+一个典型业务链条如下：
+
+1. **先预测明天的供需**：预测明天每个时段的负荷、新能源出力、联络线、机组状态等。
+2. **日前市场先出一版计划和价格**：市场根据预测数据和报价，提前形成日前出清结果、日前价格和计划安排。
+3. **实时市场再按实际情况修正**：到了真实运行时，负荷、新能源、机组、通道约束可能和预测不同，所以实时市场会重新出清，形成实时价格。
+4. **日前和实时之间形成价差**：如果实时价格高于日前价格，说明实际运行比预测更紧张；如果实时价格低于日前价格，可能是实际供给更宽松或需求更低。
+5. **业务人员根据价格、负荷、出力和边界条件做研判**：例如判断高价是否由负荷上升、新能源下降、联络线变化、机组开机不足、断面阻塞等因素造成。
+6. **最后进入结算和复盘**：市场会根据规则、价格、电量、偏差、阻塞等结果进行结算；业务侧则需要复盘价格变化、风险暴露和策略效果。
+
+因此，这个 Agent 基础表环境不是为了单纯存几张曲线，而是为了支撑一条完整的分析链：
+
+```text
+地区/时间识别
+  -> 查价格
+  -> 查负荷和新能源
+  -> 查边界条件和竞价空间
+  -> 算价差和偏差
+  -> 做趋势、对比、归因和复盘
+```
+
+客户常问“要不要买”“为什么价格高”“是否有套利机会”“预测准不准”，这些问题最终都要落到这几类基础事实上。
+
+## 0.2 行业名词和表概念逐条详解
+
+这一节的目的不是做术语堆砌，而是把“业务为什么要这样运转”和“数据库为什么要这样存”连起来。用户用自然语言问问题时，Agent 需要先理解这些词背后的市场逻辑，再决定查哪张表、按什么时间粒度查、是否要做聚合或对比。
+
+### 0.2.1 现货市场
+
+现货市场是围绕较短时间尺度的电能交易和调度形成的市场。它关注的不是一年或一个月的长期合同，而是某一天、某个小时、某个 15 分钟或 30 分钟点上，电力系统实际需要多少电、有哪些电源可以发电、价格应该如何形成。
+
+它的核心逻辑是：电不能大规模低成本储存，系统每个时刻都要尽量保持发电和用电平衡，所以市场价格需要跟着供需、机组状态、新能源出力、联络线约束等条件不断变化。
+
+在本设计里，现货市场相关数据主要落在价格、价差、负荷、出力、边界、机组状态几类表中。客户问“行情怎么样”“为什么价格高”“是否有价差机会”“预测准不准”，本质上都是围绕现货市场的价格结果和影响因素做查询。
+
+### 0.2.2 为什么会有日前市场
+
+日前市场可以理解为“提前一天为明天做一版市场化计划”。电力系统不能等到真正用电那一刻才临时决定所有机组怎么开、通道怎么用、价格怎么定，因为机组启停、燃料安排、交易计划、负荷预测和调度安全都需要提前准备。
+
+日前市场使用的是对明天的预测信息，例如预测负荷、预测风电、预测光伏、机组可用容量、检修计划、联络线计划和市场主体报价。市场根据这些信息进行出清，形成明天每个时段的日前价格、出清电量和计划结果。
+
+所以，日前市场不是“真实运行结果”，而是“基于运行日前预测和申报形成的计划性市场结果”。它的价值在于提前给交易和调度一个参考基准，让市场主体可以安排购售电策略，也让系统提前识别明天可能紧张的时段。
+
+在表里，日前市场通常用 `market_stage='day_ahead'` 表示。查询“日前价格”“日前预测价格”“日前出清电价”时，Agent 应该优先查 `pm_{region_code}_price_curve`，并过滤日前市场阶段。
+
+### 0.2.3 日前市场价格
+
+日前市场价格通常不是一个数，而是一条覆盖全天多个时点的价格曲线。用户说“查某天日前价格”时，如果没有要求平均值、最高值或最低值，一般应该返回该日每个时间点的价格序列。
+
+时间粒度由地区规则和数据源决定，常见口径包括：
+
+| 粒度 | 含义 | 一天有多少个点 | 举例 |
+|---|---|---:|---|
+| `D24` | 1 小时一个点 | 24 点 | 00:00、01:00、02:00 |
+| `D48` | 30 分钟一个点 | 48 点 | 00:30、01:00、01:30 |
+| `D96` | 15 分钟一个点 | 96 点 | 00:15、00:30、00:45 |
+
+因此，“日前市场价格是 D48 的数据还是只有一个数”这个问题，答案是：它应该按曲线存，不应该只存一个日均数。当前设计允许 `D24`、`D48`、`D96`，第一阶段价格表建议用 `D48` 或按真实样例口径落库；如果某地区真实发布的是 15 分钟价格，就用 `D96`。日均价、峰段均价、谷段均价可以在查询时聚合计算，不建议替代原始点位曲线。
+
+在表里，日前价格可以这样理解：
+
+| 业务含义 | 表字段表达 |
+|---|---|
+| 哪一天 | `biz_date` |
+| 哪个时刻 | `hm`、`time_point`、`biz_time` |
+| 哪个地区 | 由物理表 `pm_{region_code}_price_curve` 和 `pm_region` 路由决定 |
+| 日前市场 | `market_stage='day_ahead'` |
+| 预测/实际/计划口径 | `data_scenario` |
+| 价格数值 | `price_yuan_per_mwh` |
+| 时间粒度 | `granularity_code` |
+
+这里要特别注意：`market_stage` 和 `data_scenario` 是两条不同维度。`market_stage='day_ahead'` 表示“日前市场阶段”，不表示这条数据一定是模型预测值；`data_scenario='forecast'` 才表示预测口径。一个日前价格既可以是模型提前预测的日前价，也可以是市场已经发布的日前出清价。
+
+| 用户说法 | 市场阶段 | 数据口径 | 查询理解 |
+|---|---|---|---|
+| 日前预测价格 | `market_stage='day_ahead'` | `data_scenario='forecast'` | 模型或业务系统在官方出清前预测的日前价格 |
+| 日前出清价格/已发布日前价格 | `market_stage='day_ahead'` | `data_scenario='actual'` 或 `data_scenario='cleared'` | 市场已经发布的日前出清结果；不是实时运行实际值 |
+| 实时实际价格 | `market_stage='real_time'` | `data_scenario='actual'` | 真实运行时形成或发布的实时价格 |
+| 模拟日前价格 | `market_stage='day_ahead'` | `data_scenario='simulated'` | 用于策略推演或构造样例的数据 |
+
+为了保持 SQL 简单，当前真实 SQL 案例映射中把“已发布日前出清价格”写成 `data_scenario='actual'`。如果后续希望更严格区分“已出清”和“实际记录”，也可以统一改用 `data_scenario='cleared'`，但同一类数据必须全库一致，不能一部分用 `actual`、一部分用 `cleared`。
+
+如果用户问“海川省 2025-09-01 日前价格如何”，合理结果是返回 48 个或 96 个时点的价格走势。如果用户问“海川省 2025-09-01 日前均价是多少”，才应该对全天价格做 `AVG(price_yuan_per_mwh)` 聚合，返回一个数。
+
+### 0.2.4 为什么会有实时市场
+
+实时市场可以理解为“实际运行时对日前计划的修正”。日前市场依赖预测，但真实运行中经常出现偏差，例如天气变化导致负荷变化，风电光伏实际出力偏离预测，机组临时故障，联络线计划变化，局部断面约束变紧。
+
+这些偏差会让实际供需情况和日前计划不一致。为了让系统在真实运行中仍然保持平衡，就需要实时市场根据最新数据重新出清，形成实时价格和实时结果。
+
+在表里，实时市场通常用 `market_stage='real_time'` 表示。查询“实时价格”“实际出清价”“现在价格”时，Agent 应该查价格曲线表中的实时阶段数据。如果用户问的是“最新实时价格”，还需要结合最新 `biz_time` 或批次时间判断最新点位。
+
+### 0.2.5 实时市场价格
+
+实时市场价格也通常是一条曲线，不是只有一个数。它反映每个实际运行时点的供需紧张程度。实时价格可以按 `D96`、`D48` 或其他地区规定粒度存储，本设计用 `granularity_code` 记录具体粒度。
+
+和日前价格相比，实时价格更接近实际运行结果，所以它常用于回答：
+
+| 问题 | 查询逻辑 |
+|---|---|
+| 当前价格是多少 | 查最新 `market_stage='real_time'` 的价格点 |
+| 今天价格为什么突然升高 | 查实时价格曲线，再联查负荷、出力、边界、机组状态 |
+| 日前买贵了还是买便宜了 | 对比日前价格和实时价格 |
+| 预测价格是否准确 | 对比预测口径和实际实时价格 |
+
+如果用户问“近 30 天山东省实时价格如何”，不是只返回 30 个日均数，而是先取近 30 天所有实时价格点，再根据用户需求展示曲线、均价、峰谷差、极值或异常时段。
+
+### 0.2.6 日前和实时为什么会有价差
+
+日前价格来自运行前一天的预测和申报，实时价格来自实际运行时的最新供需和约束。只要预测和实际不完全一致，日前和实时之间就可能出现价差。
+
+常见原因包括：
+
+| 原因 | 对价差的影响 |
+|---|---|
+| 实际负荷高于日前预测 | 实时市场更紧张，实时价格可能高于日前价格 |
+| 实际新能源低于预测 | 可用低边际成本电源减少，实时价格可能上升 |
+| 机组临时故障或检修变化 | 可用供给减少，实时价格可能上升 |
+| 联络线或断面受限 | 便宜电送不过来，局部实时价格可能升高 |
+| 实际负荷低于预测或新能源超发 | 实时市场更宽松，实时价格可能低于日前价格 |
+
+在本设计里，价差可以直接存到 `pm_{region_code}_price_spread_curve`，也可以由价格表临时计算。为了让 Agent 更稳，常见的日前实时价差建议预先落表，使用 `spread_type='day_ahead_minus_real_time'` 或类似编码。这样用户问“价差是否稳定”“是否有套利空间”时，不必每次都让模型临时拼复杂 SQL。
+
+### 0.2.7 出清
+
+出清是市场根据报价、需求、约束和规则计算成交结果的过程。可以把它理解成市场在回答一个问题：在当前时间点，为满足用电需求，哪些电源或交易申报被接受，接受多少电量，最终形成什么价格。
+
+出清通常会考虑：
+
+| 输入条件 | 作用 |
+|---|---|
+| 负荷需求 | 决定系统需要满足多少用电 |
+| 发电侧报价 | 决定不同电源愿意以什么价格供电 |
+| 机组可用容量 | 决定有多少发电能力可以参与 |
+| 新能源预测或实际出力 | 影响剩余需要市场化机组供应的空间 |
+| 联络线和断面约束 | 决定电能能否从一个区域送到另一个区域 |
+| 市场规则 | 决定价格和成交量的计算口径 |
+
+所以出清不是单纯查一个价格字段，而是价格、电量、机组、约束共同作用后的结果。当前基础表优先存价格曲线和关键边界条件；如果后续要回答“出清了多少电量”“多少台机组中标”“平均出清价是多少”，就需要建设 `pm_{region_code}_clearing_summary_curve`。
+
+### 0.2.8 出清价格
+
+出清价格是市场出清后形成的价格。它可以有多种口径，例如日前出清价格、实时出清价格、节点边际价格、负荷侧价格、统一结算价等。用户自然语言里说“电价”“市场价”“出清价”，Agent 需要结合上下文判断具体口径。
+
+在本设计里，出清价格主要存在 `pm_{region_code}_price_curve`：
+
+| 字段 | 解释 |
+|---|---|
+| `market_stage` | 区分日前、实时、结算等阶段 |
+| `price_type` | 区分市场价、边际价、统一结算价等价格口径 |
+| `price_yuan_per_mwh` | 价格数值，单位为元/MWh |
+| `granularity_code` | 曲线粒度，例如 D48、D96 |
+
+如果用户只说“出清价格”，建议 Agent 先按最常用市场价格口径查询，并在回答中说明采用的口径；如果用户明确说“日前出清价格”或“实时出清价格”，则分别过滤 `day_ahead` 或 `real_time`。
+
+### 0.2.9 出清电量
+
+出清电量是在市场出清中被成交、安排或认可的电量。价格回答的是“多少钱”，电量回答的是“成交了多少”。两者经常一起用于复盘市场结果。
+
+当前价格表中预留了 `cleared_energy_mwh`，适合在价格点位旁边附带对应出清电量。但如果业务后续需要更完整地分析机组中标电量、分类型成交电量、买卖双方成交结构，就不应该全部塞进价格表，而应该建设单独的出清汇总或申报成交表。
+
+因此，第一阶段可以在价格表里保留基础出清电量字段；第二阶段如果任务变成“解释中标量”“分析主体报价行为”“做结算追溯”，再扩展更细的表。
+
+### 0.2.10 负荷、系统负荷和直调负荷
+
+负荷就是用电需求。某个时刻有多少用户在用电，系统就需要组织相应发电和输电能力去满足它。负荷越高，系统通常越紧张，价格也更容易上升。
+
+系统负荷是一个地区电网整体层面的用电需求，适合回答“全省用电需求是否上升”“高价是否和总负荷有关”。直调负荷是调度机构直接调度口径下的负荷，部分地区在计算竞价空间、边界条件时更常用直调负荷。
+
+在表里，负荷主要存在 `pm_{region_code}_load_curve`，并通过 `load_type` 区分：
+
+| 口径 | 字段表达 | 用途 |
+|---|---|---|
+| 系统负荷 | `load_type='system_load'` | 看全地区用电需求 |
+| 直调负荷 | `load_type='direct_dispatch_load'` | 做调度口径和竞价空间分析 |
+| 净负荷 | `load_type='net_load'` | 扣除部分新能源或固定出力后的剩余需求 |
+
+客户问“为什么价格高”时，负荷表是最基础的解释来源之一，但不能只看负荷。价格高可能是负荷高，也可能是新能源低、机组少、通道堵或边界条件收紧。
+
+### 0.2.11 新能源出力、风电预测和光伏预测
+
+新能源出力是风电、光伏等新能源在某个时点实际发出的功率。因为风和光照具有波动性，新能源出力会显著影响现货价格。新能源大发时，系统可用低边际成本电源增加，价格可能下降；新能源低于预期时，市场化机组需要补足更多供给，价格可能上升。
+
+风电预测和光伏预测是对未来出力的估计。日前市场会用预测值安排明天计划，实时市场则会受到实际出力影响。因此，预测和实际之间的偏差，是解释日前/实时价差的重要因素。
+
+在表里，新能源数据主要存在 `pm_{region_code}_generation_output_curve`：
+
+| 业务对象 | 字段表达 |
+|---|---|
+| 风电 | `energy_type='wind'` |
+| 光伏 | `energy_type='solar'` |
+| 水电 | `energy_type='hydro'` |
+| 抽蓄 | `energy_type='pumped_storage'` |
+| 预测值 | `data_scenario='forecast'` |
+| 实际值 | `data_scenario='actual'` |
+
+用户问“风电出力骤降但价格只涨 8%，是否反应不足”时，Agent 不能只查风电表，还要联查价格表、负荷表和边界表，看当时负荷、新能源总出力、竞价空间是否同步变化。
+
+### 0.2.12 机组
+
+机组是具体发电设备或发电单元，例如火电机组、燃气机组、水电机组等。电力市场里，机组不是一个抽象概念，它决定了某个时段到底有多少供给能力可以参与市场。
+
+机组相关概念包括：
+
+| 概念 | 解释 |
+|---|---|
+| 装机容量 | 机组理论最大容量 |
+| 可用容量 | 当前考虑故障、检修、约束后可用的容量 |
+| 开机容量 | 已经处于开机或可供电状态的容量 |
+| 检修容量 | 因检修暂时不可用的容量 |
+| 机组状态 | 在线、停机、检修、备用等状态 |
+
+机组状态会影响供给侧弹性。即使负荷没有明显升高，如果大量机组检修、开机容量不足或灵活调节能力下降，价格也可能维持高位。
+
+在本设计里，机组明细状态放在 `pm_{region_code}_unit_status_curve`。如果只是做简化归因，也可以在 `pm_{region_code}_boundary_curve` 中保留开机容量、检修容量等汇总字段。
+
+### 0.2.13 联络线、断面和阻塞
+
+联络线是地区之间输送电力的通道。某地区本地电源不够时，可以通过联络线接受外来电；本地电力富余时，也可能通过联络线送出。
+
+断面是电网中一组关键输电通道或约束边界，可以理解为系统安全运行中重点监控的“通道约束”。当某个断面达到安全约束上限时，即使外部有便宜电，也可能送不过来。
+
+阻塞就是输电通道受限导致电能不能按最经济方式流动。阻塞会让不同区域、不同节点出现价格分化，也会影响结算中的阻塞盈余解释。
+
+本设计第一阶段不强依赖断面明细表，但保留 `pm_{region_code}_interface_flow_curve` 作为扩展表。若客户问题集中在“哪些断面容易阻塞”“阻塞如何导致分区价差”，就需要补充断面潮流、限额、利用率、阻塞状态等字段。
+
+### 0.2.14 边界条件
+
+边界条件是市场出清前已经确定或预测到的一组运行条件。它描述的是“市场在什么条件下出清”，不是最终价格本身。
+
+边界条件常包括：
+
+| 边界条件 | 业务含义 |
+|---|---|
+| 负荷 | 需要满足的需求 |
+| 新能源出力 | 低边际成本供给情况 |
+| 联络线受入或送出 | 外来电或外送电能力 |
+| 非市场机组出力 | 不参与市场竞争但会占用或补充供给的出力 |
+| 自备机组出力 | 企业自有电源对系统需求口径的影响 |
+| 固定出力 | 必须按计划运行、不可灵活参与竞争的出力 |
+| 检修容量 | 供给侧不可用容量 |
+
+为什么要查边界表？因为价格表只能告诉你“价格高了”，边界表才能帮助解释“为什么高”。比如负荷下降但价格仍高，可能是新能源下降更多、外来电减少、机组检修增加或竞价空间收紧。
+
+在本设计里，边界条件主要存在 `pm_{region_code}_boundary_curve`。这张表是价格归因类问题的核心支撑表。
+
+### 0.2.15 竞价空间
+
+竞价空间可以简化理解为“需要由市场化机组竞争供应的剩余需求”。它通常不是直接采集到的原始字段，而是由负荷、新能源、联络线、非市场机组、固定出力等指标计算得到。
+
+一个简化理解公式是：
+
+```text
+竞价空间 = 负荷 - 新能源出力 - 外来电 - 非市场机组出力 - 其他固定出力
+```
+
+不同地区真实公式可能不同，所以本设计不把公式写死在 Agent 提示词里，而是用 `pm_metric_formula` 管理公式，用 `formula_code` 或 `bidding_space_formula_code` 关联到具体地区口径。
+
+竞价空间越大，说明需要市场化机组竞争供应的电量越多，供需可能越紧，价格上行压力可能越大。客户问“气温下降、负荷下降预期下为什么价格仍高”时，竞价空间就是很关键的解释指标。
+
+### 0.2.16 预测值、实际值和预测误差
+
+预测值是在事情发生前，根据模型、规则或人工判断估计出来的数据。实际值是运行后真实发生的数据。预测误差就是两者之间的差。
+
+在电力市场里，预测误差非常重要，因为日前市场依赖预测，实时市场反映实际。如果负荷预测偏低或新能源预测偏高，就可能导致日前价格低估实时紧张程度，最终形成实时高价和较大价差。
+
+在表里，预测和实际用 `data_scenario` 区分：
+
+| 数据口径 | 字段表达 |
+|---|---|
+| 预测值 | `data_scenario='forecast'` |
+| 实际值 | `data_scenario='actual'` |
+| 计划值 | `data_scenario='planned'` |
+| 模拟值 | `data_scenario='simulated'` |
+
+如果要评估模型准不准，Agent 应该把同一地区、同一日期、同一时点、同一指标的预测值和实际值对齐，再计算 MAE、MAPE、RMSE、偏差方向、极值误差等指标。
+
+### 0.2.17 统一结算价和边际价格
+
+统一结算价是结算环节可能使用的一种统一价格口径。它更偏向“最后怎么结算”，不一定等同于市场每个节点或每个分区实时形成的边际价格。
+
+边际价格可以理解为在某个时点、某个区域，系统为多满足一单位用电需求所对应的边际成本或价格信号。它更偏向市场出清和价格形成机制。
+
+在表里，这类差异不需要拆成很多张价格表，而是通过 `price_type` 区分：
+
+| 用户说法 | 字段表达 |
+|---|---|
+| 市场价格 | `price_type='market_price'` |
+| 负荷侧价格 | `price_type='load_side_price'` |
+| 边际价格 | `price_type='marginal_price'` |
+| 统一结算价 | `price_type='unified_price'` |
+
+用户问“结算价为什么和实时价不一样”时，仅查价格曲线可能不够，还需要结合结算规则、合同、偏差考核、阻塞分摊等规则文档，这部分通常由 RAG 知识库补充解释。
+
+### 0.2.18 非市场机组和自备机组
+
+非市场机组是指不完全通过现货市场竞争形成出力安排的机组或出力口径。自备机组通常是企业或用户自有、主要满足自身用电需求的发电设备。
+
+这些出力虽然不一定直接参与现货竞价，但会影响系统供需边界。比如自备机组多发，可能减少用户从电网购电需求；非市场机组固定出力较高，可能压缩市场化机组需要竞争的空间。
+
+在表里，这些指标一般进入 `pm_{region_code}_boundary_curve`：
+
+| 指标 | 字段 |
+|---|---|
+| 非市场机组出力 | `non_market_output_mw` |
+| 自备机组出力 | `self_generation_output_mw` |
+| 试验机组出力 | `test_unit_output_mw` |
+| 固定出力 | `fixed_output_mw` |
+
+用户问“竞价空间为什么变小”或“负荷没降多少但价格下来了”时，这些边界出力可能就是解释变量。
+
+## 0.3 为什么要查这些表
+
+这个基础表环境按业务分析逻辑拆成几类表：
+
+| 表 | 查什么 | 解决什么业务问题 |
+|---|---|---|
+| `pm_{region_code}_price_curve` | 日前价、实时价、预测价、实际价、边际价、统一结算价 | 回答“现在价格是多少”“某天价格走势如何”“预测和实际差多少” |
+| `pm_{region_code}_price_spread_curve` | 日前/实时价差、预测/实际价差、分区价差、跨地区价差 | 回答“有没有套利空间”“价差是否异常”“风险收益如何” |
+| `pm_{region_code}_load_curve` | 系统负荷、实时负荷、直调负荷、净负荷 | 回答“需求是否上升”“高价是否和负荷有关” |
+| `pm_{region_code}_generation_output_curve` | 风电、光伏、水电、抽蓄、总出力、预测/实际出力 | 回答“新能源是否影响价格”“风电预测准不准”“光伏大发时价格会怎样” |
+| `pm_{region_code}_boundary_curve` | 负荷、联络线、新能源、非市场机组、固定出力、竞价空间 | 回答“为什么价格高”“供需是否紧张”“竞价空间是否收紧” |
+| `pm_{region_code}_unit_status_curve` | 机组开停、开机容量、可用容量、检修状态 | 回答“开机容量是否影响价格”“供给侧是否紧张” |
+| `pm_metric_formula` | 价差、竞价空间等计算公式 | 解决不同地区公式不同的问题，让 Agent 不把公式写错 |
+| `pm_metric_dict` | 自然语言指标和表字段映射 | 让 Agent 知道“日前价格”“实时价差”“竞价空间”应该查哪张表、哪个字段 |
+| `pm_region` | 虚构省份名和物理表名前缀映射 | 让用户能说“海川省”，系统内部路由到 `pm_r02_*` |
+
+这些表之间的关系可以理解为：
+
+```text
+价格表告诉你“结果是什么”
+负荷表和出力表告诉你“需求和供给发生了什么”
+边界表告诉你“市场出清前的约束条件是什么”
+价差表告诉你“日前和实时之间偏离了多少”
+机组状态表告诉你“供给侧可用能力是否充足”
+指标字典和公式表告诉 Agent“自然语言该怎么翻译成 SQL”
+```
+
+## 0.4 表字段概念速查
+
+下面这些字段会在多张业务表中反复出现，理解它们后，后面的表结构会更容易读。
+
+| 字段或枚举 | 出现位置 | 含义 | 举例 |
+|---|---|---|---|
+| `biz_date` | 所有曲线表 | 业务日期 | `2025-09-01` |
+| `hm` | 所有曲线表 | 时刻，通常是小时分钟 | `05:45` |
+| `time_point` | 所有曲线表 | 日内点位编号 | D96 下 `05:45` 通常是某个 15 分钟点 |
+| `biz_time` | 所有曲线表 | 完整业务时间 | `2025-09-01 05:45:00` |
+| `granularity_code` | 所有曲线表 | 时间粒度 | `D96` 表示一天 96 点，15 分钟一个点；`D48` 表示一天 48 点，30 分钟一个点；`D24` 表示一天 24 点，1 小时一个点 |
+| `region_name` | 价格、负荷、出力、边界表 | 区内分区、节点或区域名；不是省份名 | 地区级填 `ALL`，分区可填 `zone_a`、`zone_b` |
+| `device_name` | 价格、负荷、出力、边界表 | 电网、节点、机组、场站或设备展示名 | 地区级价格可填电网名，机组状态填机组名 |
+| `market_stage` | 价格、出力、边界表 | 市场阶段 | `day_ahead` 日前，`real_time` 实时，`settlement` 结算 |
+| `data_scenario` | 价格、负荷、出力、边界表 | 数据场景或口径 | `forecast` 预测，`actual` 已发布或实际记录，`cleared` 出清结果，`planned` 计划，`simulated` 模拟 |
+| `price_type` | 价格表 | 价格口径 | `market_price` 市场价，`load_side_price` 负荷侧价，`marginal_price` 边际价，`unified_price` 统一结算价 |
+| `energy_type` | 出力表 | 发电类型 | `wind` 风电，`solar` 光伏，`renewable` 新能源，`hydro` 水电，`pumped_storage` 抽蓄 |
+| `load_type` | 负荷表 | 负荷口径 | `system_load` 系统负荷，`direct_dispatch_load` 直调负荷，`net_load` 净负荷 |
+| `spread_type` | 价差表 | 价差类型 | `day_ahead_minus_real_time` 表示日前价减实时价 |
+| `formula_code` | 价差表、公式表、边界表 | 公式编码 | `price_spread_da_rt`、`bid_space_r01` |
+| `quality_status` | 所有业务表 | 数据质量状态 | `synthetic` 构造数据，`normal` 正常，`abnormal` 异常 |
+| `forecast_issue_time` | 预测类数据 | 预测结果发布时间 | 用于保留多版预测，判断哪一版是最新预测 |
+| `forecast_model_code` | 预测类数据 | 预测模型编码 | 用于比较不同模型误差 |
+| `forecast_horizon_minutes` | 预测类数据 | 预测提前量 | 例如提前 4 小时预测可记为 240 |
+| `is_latest_forecast` | 预测类数据 | 是否为该时点最新预测版本 | 查询“当前预测”时通常过滤为 `true` |
+
+最常见的自然语言到字段映射如下：
+
+| 用户说法 | 数据库过滤方式 |
+|---|---|
+| 日前价格 | `market_stage='day_ahead'` |
+| 实时价格 | `market_stage='real_time'` |
+| 预测日前价格 | `market_stage='day_ahead' AND data_scenario='forecast'` |
+| 日前出清价格 | `market_stage='day_ahead' AND data_scenario IN ('actual','cleared')`，具体取决于全库统一口径 |
+| 实际实时价格 | `market_stage='real_time' AND data_scenario='actual'` |
+| 风电预测出力 | `energy_type='wind' AND data_scenario='forecast'` |
+| 光伏实际出力 | `energy_type='solar' AND data_scenario='actual'` |
+| 日前实时价差 | `spread_type='day_ahead_minus_real_time'` |
+| 竞价空间 | 查询 `pm_{region_code}_boundary_curve.bidding_space_mw`，并查看 `bidding_space_formula_code` |
+
+## 1. 当前设计结论
+
+当前项目没有可直接接入的原始数据。所有业务数据都按电力市场常见口径重新构造，因此数据库不再设计“原始层、来源层、抽取层、查询层”等多层结构。
+
+本项目只建设一套能直接使用的关系型基础表环境：
+
+1. **基础业务表**：承载价格、负荷、出力、边界条件、出清、断面、机组状态、事件等业务数据。
+2. **支撑管理表**：承载表注册、指标映射、时间点、版本、实体、文件入库和人工校验。
+3. **派生视图/派生表**：只在能明显降低 SQL 难度时使用，例如跨地区统一视图、价差表。
+
+不再区分“原始表”和“从原始表抽取后的查询表”。在当前项目里，`pm_*` 表就是基础表环境本身。
+
+已有 docx、截图或表格样例只作为“字段形态、指标口径、业务问法”的参考，不作为全量地区和全量表的覆盖清单。即使样例里只出现了某几个地区，也应认为各地区存在相似业务表，数据库按统一地区模板批量构造。
+
+### 1.1 本次对比核查结论
+
+本次对比依据三份材料：
+
+1. `电力市场Agent业务需求说明.md`：重点关注 8.1 基础事实查询、8.2 聚合统计查询、8.3 对比分析查询、8.4 多指标归因研判、8.5 图表和 8.6 日复盘所依赖的结构化行情数据。
+2. `sql/真实市场数据问题SQL查询案例.docx`：重点关注价格、价差、边界条件、竞价空间和开机容量案例。
+3. `sql/客户提问问题list.xlsx`：重点关注客户真实问法中的现货交易辅助、价差套利、行情校验、负荷归因、新能源影响、预测模型评估、断面阻塞、机组状态、用户偏差、结算解释和规则问答。
+
+天气、权限、RAG、外部网页 DeepResearch、合同结算明细、市场主体明细等扩展业务本轮不纳入基础表环境判断。
+
+| 需求或 SQL 案例 | 当前表结构是否满足 | 处理结论 |
+|---|---|---|
+| 日前/实时/预测/实际价格 | 基本满足 | `pm_{region_code}_price_curve` 可覆盖，补充边际价和预测发布时间字段 |
+| 分区价格、边际价格、统一结算价 | 部分满足 | 用 `region_name` 表示分区，`price_type` 补充 `marginal_price`、`unified_price` |
+| 日前减实时价差、实际价差、预测价差、分区价差 | 原设计偏弱 | 将 `pm_{region_code}_price_spread_curve` 调整为必建基础派生表 |
+| 边界条件和竞价空间 | 部分满足 | `pm_{region_code}_boundary_curve` 补充受电、固定出力、自备机组、试验机组等字段 |
+| 各省竞价空间公式不同 | 原设计缺少显式公式管理 | 新增 `pm_metric_formula`，维护不同地区的竞价空间、价差等计算公式 |
+| 开机容量 | 可选满足 | 文档案例标注“一期可暂不考虑”，保留在 `pm_{region_code}_unit_status_curve` 中作为 P1/P2 扩展 |
+
+## 2. 基础表环境总清单
+
+### 2.1 必建表
+
+| 表名 | 类型 | 用途 |
+|---|---|---|
+| `pm_region` | 支撑管理表 | 维护脱敏地区编码、虚构省份名和自然语言别名 |
+| `pm_data_version` | 支撑管理表 | 固定构造数据版本，保证 benchmark 可复现 |
+| `pm_time_point_dict` | 支撑管理表 | 维护 D96、D48、D24 点位和时刻映射 |
+| `pm_metric_dict` | 支撑管理表 | 维护自然语言指标到表字段/过滤条件的映射 |
+| `pm_table_catalog` | 支撑管理表 | 维护可查询表清单、业务域和表状态 |
+| `pm_entity_dict` | 支撑管理表 | 维护电网、机组、节点、断面等脱敏实体 |
+| `pm_metric_formula` | 支撑管理表 | 维护价差、竞价空间等指标公式 |
+| `pm_{region_code}_price_curve` | 基础业务表 | 日前、实时、节点、统一结算等价格曲线 |
+| `pm_{region_code}_price_spread_curve` | 基础派生表 | 日前减实时、预测价差、分区价差、跨地区价差 |
+| `pm_{region_code}_load_curve` | 基础业务表 | 系统负荷、实时负荷、直调负荷、净负荷 |
+| `pm_{region_code}_generation_output_curve` | 基础业务表 | 风电、光伏、水电、抽蓄、总出力 |
+| `pm_{region_code}_boundary_curve` | 基础业务表 | 系统边界条件和竞价空间 |
+| `pm_import_batch` | 支撑管理表 | 文件入库批次和人工审核状态 |
+| `pm_import_staging_row` | 支撑管理表 | 文件解析后的暂存数据行 |
+
+### 2.2 可选表
+
+| 表名 | 类型 | 什么时候建 |
+|---|---|---|
+| `pm_{region_code}_clearing_summary_curve` | 基础业务表 | 需要回答出清电量、机组台数、平均出清价时建 |
+| `pm_{region_code}_interface_flow_curve` | 基础业务表 | 需要做断面约束、通道潮流归因时建 |
+| `pm_{region_code}_unit_status_curve` | 基础业务表 | 需要做开机容量、可用容量、检修、机组状态分析时建 |
+| `pm_{region_code}_market_event` | 基础业务表 | 需要做复盘报告和异常归因时建 |
+| `pm_{region_code}_node_power_forecast_curve` | 基础业务表 | 需要做节点级预测功率问题时建 |
+
+### 2.3 不建表
+
+| 内容 | 原因 |
+|---|---|
+| 独立天气业务表 | 当前基础环境不沉淀天气数据；需要天气时走外部 API、网页搜索或工具调用 |
+| 合同、申报、结算账单、市场主体明细 | 涉及私有数据和权限，第一阶段不做；统一结算价仍可放在价格曲线表 |
+| 原始数据源表 | 当前没有原始数据，所有数据都重新构造 |
+| benchmark 业务表 | benchmark 用外部 JSON/JSONL 黄金标准文件维护，不进入业务库 |
+
+## 3. 地区模板和命名规则
+
+### 3.1 地区表名脱敏
+
+脱敏重点放在物理表名和真实省份映射上。表名不使用真实省份名，而使用 `r01`、`r02`、`r03` 这类编码；自然语言问题、演示数据和 benchmark 任务可以使用虚构省份名。
+
+真实省份名和真实映射不进入公开库。如果需要保留真实映射，只能放在私有配置或内部环境中。
+
+| 地区编码 | 表名前缀 | 虚构省份名 | 自然语言别名示例 |
+|---|---|---|---|
+| R01 | `pm_r01_` | 东岭省 | 东岭、东岭省、东岭电力市场 |
+| R02 | `pm_r02_` | 海川省 | 海川、海川省、海川市场 |
+| R03 | `pm_r03_` | 云河省 | 云河、云河省、云河日前市场 |
+| R04 | `pm_r04_` | 北澜省 | 北澜、北澜省 |
+| R05 | `pm_r05_` | 南岭省 | 南岭、南岭省 |
+
+### 3.2 表名模板
+
+```text
+pm_{region_code}_{business_suffix}
+```
+
+示例：
+
+```text
+pm_r01_price_curve
+pm_r02_generation_output_curve
+pm_r03_boundary_curve
+```
+
+### 3.3 为什么仍按地区拆表
+
+虽然数据是重新构造的，但业务问题通常还是按地区提问，例如：
+
+```text
+海川省光伏预测出力是多少？
+云河省日前边界条件如何？
+近 30 天东岭省日前价格如何？
+```
+
+按地区拆物理表，可以让 Agent 的第一步变成“识别自然语言省份名并映射到地区编码”，第二步选择地区表，第三步再过滤时间和指标。这样比所有地区混在一张大表里更接近业务表格形态，也更适合设计 Text-to-SQL benchmark。
+
+跨地区问题通过统一视图解决。视图可以输出虚构省份名，但不输出真实省份名。
+
+### 3.4 地区表同构原则
+
+docx 中出现的表只是局部样例，不代表只有这些地区存在对应业务表。正式设计按下面规则处理：
+
+| 规则 | 说明 |
+|---|---|
+| 同一业务后缀，字段结构一致 | 例如 `pm_r01_price_curve`、`pm_r02_price_curve`、`pm_r03_price_curve` 都使用同一套价格曲线字段 |
+| 地区差异体现在表名前缀和数据内容 | 表结构不因为地区不同而变化，差异只体现在数值、时间范围、设备/节点、业务场景 |
+| docx 只证明业务表形态 | 文档里出现某地区价格表，可作为设计 `price_curve` 模板的依据，但不能理解为其他地区没有价格表 |
+| 新地区按模板扩展 | 新增 R04、R05 时，复制同一业务模板并在 `pm_table_catalog`、`pm_region`、`pm_entity_dict` 中注册 |
+| Agent 路由按“省份别名 + 业务域”定位 | 先把“海川省”映射到 R02，再识别 price、load、generation_output、boundary 等业务域，最后落到具体物理表 |
+
+因此，当前基础库不是“把 docx 里出现过的表原样搬进数据库”，而是“从局部样例抽象出地区同构业务表模板，再生成可用于 Agent 查询和评测的完整基础表环境”。
+
+## 4. 构造数据规则
+
+### 4.1 数据版本
+
+所有构造数据必须带 `data_version_code`。建议第一版使用：
+
+```text
+DEMO_SYNTH_V1
+```
+
+这个版本用于固定 benchmark 答案，后续如果重新造数，新增版本，不覆盖旧版本。
+
+### 4.2 推荐构造范围
+
+| 内容 | 建议 |
+|---|---|
+| 地区 | R01、R02、R03，后续扩展 R04、R05；自然语言展示为虚构省份名 |
+| 日期范围 | 30 天或 90 天 |
+| 价格粒度 | D48 或 D96，第一阶段建议 D48 |
+| 负荷和出力粒度 | D96 |
+| 边界条件粒度 | D96 |
+| 数据质量 | `quality_status='synthetic'` |
+
+### 4.3 最小可用数据量
+
+| 表 | 最小数据量 |
+|---|---|
+| `pm_r02_generation_output_curve` | 至少 1 天 × 96 点 × wind/solar/total |
+| `pm_r02_load_curve` | 至少 1 天 × 96 点 × forecast/actual |
+| `pm_r03_boundary_curve` | 至少 1 天 × 96 点 |
+| `pm_r01_price_curve` | 至少 1 天 × 48 点 × day_ahead/real_time |
+| `pm_r01_price_spread_curve` | 至少 1 天 × 24 或 48 点 × day_ahead_minus_real_time |
+
+只要这些表有固定构造数据，就可以先生成第一批 benchmark。
+
+## 5. 基础业务表设计
+
+### 5.1 `pm_{region_code}_price_curve`
+
+用途：存价格曲线，支撑日前价格、实时价格、节点价、统一结算价、负荷侧价格等问题。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `price_record_id` | bigint | 主键 |
+| `data_version_code` | varchar(100) | 数据版本 |
+| `region_name` | varchar(100) | 区内分区或节点；地区级填 `ALL` |
+| `device_name` | varchar(200) | 设备名、节点名或电网名 |
+| `biz_date` | date | 日期 |
+| `hm` | varchar(10) | 时刻 |
+| `time_point` | int | 点位 |
+| `biz_time` | timestamp | 业务时间 |
+| `granularity_code` | varchar(20) | D96、D48、D24 |
+| `market_stage` | varchar(30) | `day_ahead`、`real_time`、`settlement` |
+| `price_type` | varchar(50) | `market_price`、`load_side_price`、`node_price`、`marginal_price`、`unified_price` |
+| `data_scenario` | varchar(30) | `forecast`、`actual`、`cleared`、`simulated` |
+| `forecast_issue_time` | timestamp | 预测发布时间；实际值可为空 |
+| `forecast_model_code` | varchar(100) | 预测模型编码；实际值可为空 |
+| `forecast_horizon_minutes` | int | 预测提前量；实际值可为空 |
+| `is_latest_forecast` | boolean | 是否为该时点最新预测版本 |
+| `price_yuan_per_mwh` | numeric(18,6) | 价格 |
+| `limit_price_yuan_per_mwh` | numeric(18,6) | 限价，可为空 |
+| `cleared_energy_mwh` | numeric(18,6) | 出清电量，可为空 |
+| `quality_status` | varchar(30) | `synthetic`、`normal`、`abnormal` |
+
+唯一键建议：
+
+```text
+data_version_code + region_name + device_name + biz_time + market_stage + price_type + data_scenario + forecast_issue_time
+```
+
+真实 SQL 案例中的“分区预测日前价、分区实际实时价、分区边际价、统一结算价”等宽字段，在本设计中统一拆成多行：
+
+| 原始宽字段含义 | 本表映射 |
+|---|---|
+| 分区A/分区B | `region_name` |
+| 日前/实时/结算 | `market_stage` |
+| 预测/实际 | `data_scenario` |
+| 边际价/统一结算价/负荷侧价格 | `price_type` |
+| 最新预测版本 | `forecast_issue_time` + `is_latest_forecast` |
+| 预测模型误差 | `forecast_model_code` + `forecast_horizon_minutes` + 预测/实际价格对比 |
+
+真实来源表与 SQL 案例：
+
+| 项目 | 内容 |
+|---|---|
+| 真实来源表 | `bi_db.ods_es_price_data` |
+| 对应业务 | 查询某地区某时间范围的实际日前价格 |
+
+```sql
+SELECT date AS biz_time, value AS actual_day_ahead_price
+FROM bi_db.ods_es_price_data
+WHERE price_type = '2'
+  AND org_code = '37'
+  AND date BETWEEN '2025-09-10 00:00:00' AND '2025-09-11 00:00:00'
+ORDER BY date;
+```
+
+映射到本设计后，查询目标为 `pm_{region_code}_price_curve`，其中 `market_stage='day_ahead'`、`data_scenario='actual'`、`price_type='market_price'`。
+
+### 5.2 `pm_{region_code}_price_spread_curve`
+
+用途：存常用价差结果，支撑“日前价格减实时价格”“预测价差”“实际价差”“分区价差”“跨地区价差”等基础问题。虽然价差可以从价格表自关联计算，但真实 SQL 案例中价差已经作为独立查询对象出现，第一阶段建议直接建表，降低 Agent 生成复杂 SQL 的难度。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `spread_record_id` | bigint | 主键 |
+| `data_version_code` | varchar(100) | 数据版本 |
+| `region_name` | varchar(100) | 分区或区域；地区级填 `ALL` |
+| `device_name` | varchar(200) | 设备名、节点名或电网名 |
+| `biz_date` | date | 日期 |
+| `hm` | varchar(10) | 时刻 |
+| `time_point` | int | 点位 |
+| `biz_time` | timestamp | 业务时间 |
+| `granularity_code` | varchar(20) | D96、D48、D24 |
+| `spread_type` | varchar(80) | `day_ahead_minus_real_time`、`forecast_spread`、`zonal_spread`、`cross_region_spread` |
+| `base_market_stage` | varchar(30) | 被减数市场阶段，如 `day_ahead` |
+| `compare_market_stage` | varchar(30) | 减数市场阶段，如 `real_time` |
+| `base_price_type` | varchar(50) | 被减数价格类型 |
+| `compare_price_type` | varchar(50) | 减数价格类型 |
+| `data_scenario` | varchar(30) | `forecast`、`actual`、`simulated` |
+| `base_price_yuan_per_mwh` | numeric(18,6) | 被减数价格 |
+| `compare_price_yuan_per_mwh` | numeric(18,6) | 减数价格 |
+| `spread_yuan_per_mwh` | numeric(18,6) | 价差 |
+| `formula_code` | varchar(100) | 公式编码，如 `price_spread_da_rt` |
+| `quality_status` | varchar(30) | 数据质量 |
+
+唯一键建议：
+
+```text
+data_version_code + region_name + device_name + biz_time + spread_type + data_scenario
+```
+
+真实来源表与 SQL 案例：
+
+| 项目 | 内容 |
+|---|---|
+| 真实来源表 | `bi_db.dwd_price` |
+| 对应业务 | 查询某地区某日实际日前/实时价差 |
+
+```sql
+SELECT biz_date AS biz_date,
+       biz_hour AS time_point_24,
+       org_code AS region_code,
+       real_dif_price AS spread_yuan_per_mwh
+FROM bi_db.dwd_price
+WHERE biz_date = '2025-10-26'
+  AND org_code = 37
+ORDER BY biz_hour;
+```
+
+映射到本设计后，查询目标为 `pm_{region_code}_price_spread_curve`，其中 `spread_type='day_ahead_minus_real_time'`、`data_scenario='actual'`。
+
+### 5.3 `pm_{region_code}_load_curve`
+
+用途：存负荷曲线，支撑实时负荷、系统负荷预测、直调负荷、净负荷等问题。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `load_record_id` | bigint | 主键 |
+| `data_version_code` | varchar(100) | 数据版本 |
+| `region_name` | varchar(100) | 区域；地区级填 `ALL` |
+| `device_name` | varchar(200) | 电网或设备名 |
+| `biz_date` | date | 日期 |
+| `hm` | varchar(10) | 时刻 |
+| `time_point` | int | 点位 |
+| `biz_time` | timestamp | 业务时间 |
+| `granularity_code` | varchar(20) | D96、D48、D24 |
+| `load_type` | varchar(50) | `system_load`、`short_term_system_load`、`rt_load`、`direct_dispatch_load`、`net_load` |
+| `data_scenario` | varchar(30) | `forecast`、`actual`、`simulated` |
+| `forecast_issue_time` | timestamp | 预测发布时间；实际值可为空 |
+| `forecast_model_code` | varchar(100) | 预测模型编码；实际值可为空 |
+| `forecast_horizon_minutes` | int | 预测提前量；实际值可为空 |
+| `is_latest_forecast` | boolean | 是否为该时点最新预测版本 |
+| `load_mw` | numeric(18,6) | 负荷 |
+| `quality_status` | varchar(30) | 数据质量 |
+
+唯一键建议：
+
+```text
+data_version_code + device_name + biz_time + load_type + data_scenario
+```
+
+真实来源表与 SQL 案例：
+
+| 项目 | 内容 |
+|---|---|
+| 真实来源表 | `luminai_platform_readonly.es_demand_data` |
+| 对应业务 | 查询某地区日前系统负荷或直调负荷曲线 |
+
+```sql
+SELECT date AS biz_time,
+       SUM(CASE WHEN demand_id = '18' THEN value ELSE 0 END) AS system_load_mw
+FROM luminai_platform_readonly.es_demand_data
+WHERE org_code = '34'
+  AND is_forecast = 1
+  AND demand_id IN ('18')
+  AND date >= '2025-09-20 00:00:00'
+  AND date <  '2025-09-21 00:00:00'
+GROUP BY date
+ORDER BY date;
+```
+
+映射到本设计后，查询目标为 `pm_{region_code}_load_curve`，其中 `load_type='system_load'`、`data_scenario='forecast'`。
+
+### 5.4 `pm_{region_code}_generation_output_curve`
+
+用途：存发电出力曲线，支撑风电、光伏、水电、抽蓄、总出力查询。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `output_record_id` | bigint | 主键 |
+| `data_version_code` | varchar(100) | 数据版本 |
+| `region_name` | varchar(100) | 区域；地区级填 `ALL` |
+| `device_name` | varchar(200) | 电网、机组或场站 |
+| `energy_type` | varchar(50) | `total`、`wind`、`solar`、`renewable`、`hydro`、`pumped_storage`、`nuclear`、`gas`、`fixed_output`、`self_generation`、`test_unit`、`non_market` |
+| `biz_date` | date | 日期 |
+| `hm` | varchar(10) | 时刻 |
+| `time_point` | int | 点位 |
+| `biz_time` | timestamp | 业务时间 |
+| `granularity_code` | varchar(20) | D96、D48、D24 |
+| `market_stage` | varchar(30) | `day_ahead`、`real_time`、`actual` |
+| `data_scenario` | varchar(30) | `forecast`、`actual`、`planned`、`simulated` |
+| `forecast_issue_time` | timestamp | 预测发布时间；实际值可为空 |
+| `forecast_model_code` | varchar(100) | 预测模型编码；实际值可为空 |
+| `forecast_horizon_minutes` | int | 预测提前量；实际值可为空 |
+| `is_latest_forecast` | boolean | 是否为该时点最新预测版本 |
+| `output_mw` | numeric(18,6) | 出力 |
+| `quality_status` | varchar(30) | 数据质量 |
+
+唯一键建议：
+
+```text
+data_version_code + device_name + energy_type + biz_time + data_scenario
+```
+
+真实来源表与 SQL 案例：
+
+| 项目 | 内容 |
+|---|---|
+| 真实来源表 | `luminai_platform_readonly.es_demand_data` |
+| 对应业务 | 查询风电、光伏和新能源总出力 |
+
+```sql
+SELECT date AS biz_time,
+       SUM(CASE WHEN demand_id = '4' THEN value ELSE 0 END) AS wind_output_mw,
+       SUM(CASE WHEN demand_id = '5' THEN value ELSE 0 END) AS solar_output_mw,
+       SUM(CASE WHEN demand_id IN ('4','5') THEN value ELSE 0 END) AS renewable_output_mw
+FROM luminai_platform_readonly.es_demand_data
+WHERE org_code = '37'
+  AND is_forecast = 1
+  AND demand_id IN ('4','5')
+  AND date >= '2025-09-20 00:00:00'
+  AND date <  '2025-09-21 00:00:00'
+GROUP BY date
+ORDER BY date;
+```
+
+映射到本设计后，可以写入 `pm_{region_code}_generation_output_curve` 三类记录：`energy_type='wind'`、`energy_type='solar'`、`energy_type='renewable'`。
+
+### 5.5 `pm_{region_code}_boundary_curve`
+
+用途：存边界条件，支撑价格归因、竞价空间、供需紧张程度分析。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `boundary_record_id` | bigint | 主键 |
+| `data_version_code` | varchar(100) | 数据版本 |
+| `region_name` | varchar(100) | 区域；地区级填 `ALL` |
+| `device_name` | varchar(200) | 电网名 |
+| `biz_date` | date | 日期 |
+| `hm` | varchar(10) | 时刻 |
+| `time_point` | int | 点位 |
+| `biz_time` | timestamp | 业务时间 |
+| `granularity_code` | varchar(20) | D96、D48、D24 |
+| `market_stage` | varchar(30) | `day_ahead`、`real_time`、`week_ahead` |
+| `data_scenario` | varchar(30) | `forecast`、`actual`、`planned`、`simulated` |
+| `forecast_issue_time` | timestamp | 预测发布时间；实际值可为空 |
+| `is_latest_forecast` | boolean | 是否为该时点最新预测版本 |
+| `sys_load_mw` | numeric(18,6) | 系统负荷 |
+| `short_term_system_load_mw` | numeric(18,6) | 短期系统负荷，可为空 |
+| `direct_dispatch_load_mw` | numeric(18,6) | 直调负荷 |
+| `tie_line_power_mw` | numeric(18,6) | 联络线功率 |
+| `receiving_power_mw` | numeric(18,6) | 外部受电或区域受电 |
+| `total_output_mw` | numeric(18,6) | 总出力 |
+| `wind_output_mw` | numeric(18,6) | 风电出力 |
+| `solar_output_mw` | numeric(18,6) | 光伏出力 |
+| `renewable_output_mw` | numeric(18,6) | 新能源总出力 |
+| `hydro_ps_output_mw` | numeric(18,6) | 水电含抽蓄出力 |
+| `non_market_output_mw` | numeric(18,6) | 非市场机组出力 |
+| `fixed_output_mw` | numeric(18,6) | 固定出力 |
+| `gas_fixed_output_mw` | numeric(18,6) | 燃机固定出力 |
+| `self_generation_output_mw` | numeric(18,6) | 自备机组出力 |
+| `test_unit_output_mw` | numeric(18,6) | 试验机组出力 |
+| `spinning_reserve_mw` | numeric(18,6) | 正备用 |
+| `downward_reserve_mw` | numeric(18,6) | 负备用 |
+| `maintenance_capacity_mw` | numeric(18,6) | 检修容量 |
+| `bidding_space_mw` | numeric(18,6) | 竞价空间 |
+| `bidding_space_formula_code` | varchar(100) | 竞价空间公式编码 |
+| `quality_status` | varchar(30) | 数据质量 |
+
+唯一键建议：
+
+```text
+data_version_code + device_name + biz_time + market_stage + data_scenario
+```
+
+真实 SQL 案例中各地区边界条件指标并不完全相同。本表用统一字段承接常见组件，不适用的字段允许为空；`bidding_space_mw` 建议直接落库，同时用 `bidding_space_formula_code` 说明其计算口径。
+
+真实来源表与 SQL 案例：
+
+| 项目 | 内容 |
+|---|---|
+| 真实来源表 | `luminai_platform_readonly.es_demand_data` |
+| 对应业务 | 查询边界条件并计算竞价空间 |
+
+```sql
+SELECT biz_time,
+       direct_dispatch_load_mw,
+       tie_line_power_mw,
+       renewable_output_mw,
+       non_market_output_mw,
+       direct_dispatch_load_mw
+         - tie_line_power_mw
+         - renewable_output_mw
+         - test_unit_output_mw AS bidding_space_mw
+FROM (
+  SELECT date AS biz_time,
+         SUM(CASE WHEN demand_id = '1' THEN value ELSE 0 END) AS direct_dispatch_load_mw,
+         SUM(CASE WHEN demand_id = '3' THEN value ELSE 0 END) AS tie_line_power_mw,
+         SUM(CASE WHEN demand_id IN ('4','5') THEN value ELSE 0 END) AS renewable_output_mw,
+         SUM(CASE WHEN demand_id IN ('8','9') THEN value ELSE 0 END) AS non_market_output_mw,
+         SUM(CASE WHEN demand_id = '9' THEN value ELSE 0 END) AS test_unit_output_mw
+  FROM luminai_platform_readonly.es_demand_data
+  WHERE org_code = '37'
+    AND is_forecast = 1
+    AND demand_id IN ('1','3','4','5','8','9')
+    AND date >= '2025-09-20 00:00:00'
+    AND date <  '2025-09-21 00:00:00'
+  GROUP BY date
+) t
+ORDER BY biz_time;
+```
+
+映射到本设计后，查询目标为 `pm_{region_code}_boundary_curve`。不同地区竞价空间公式写入 `pm_metric_formula`，结果字段统一使用 `bidding_space_mw`。
+
+### 5.6 可选业务表
+
+第一阶段至少建设价格、价差、负荷、出力、边界五类基础表。下面几张在业务场景需要时再建。
+
+| 表模板 | 用途 | 建议 |
+|---|---|---|
+| `pm_{region_code}_clearing_summary_curve` | 出清汇总、电量、机组台数、平均出清价、平均申报价 | P1 |
+| `pm_{region_code}_interface_flow_curve` | 断面潮流、限额、剩余裕度 | P1 |
+| `pm_{region_code}_unit_status_curve` | 机组开停、检修、可用容量 | P1 |
+| `pm_{region_code}_market_event` | 检修、约束、价格异常事件 | P1 |
+| `pm_{region_code}_node_power_forecast_curve` | 节点级有功预测 | P2 |
+
+开机容量案例属于可选扩展。如果需要覆盖“近一个月开机容量”和“价格变化是否与开机容量相关”，`pm_{region_code}_unit_status_curve` 至少保留以下字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `unit_status_record_id` | bigint | 主键 |
+| `data_version_code` | varchar(100) | 数据版本 |
+| `unit_name` | varchar(200) | 机组展示名 |
+| `unit_entity_code` | varchar(100) | 机组实体编码，可关联 `pm_entity_dict` |
+| `biz_date` | date | 日期 |
+| `hm` | varchar(10) | 时刻 |
+| `time_point` | int | 点位 |
+| `biz_time` | timestamp | 业务时间 |
+| `unit_status` | varchar(30) | online、offline、maintenance |
+| `unit_capacity_mw` | numeric(18,6) | 装机或申报容量 |
+| `available_capacity_mw` | numeric(18,6) | 可用容量 |
+| `quality_status` | varchar(30) | 数据质量 |
+
+开机容量查询可以按 `unit_status='online'` 汇总 `unit_capacity_mw` 或 `available_capacity_mw`。真实案例中的机组名称匹配问题由 `pm_entity_dict.aliases` 和 `unit_entity_code` 解决，不在查询 SQL 里做复杂字符串相似度匹配。
+
+真实来源表与 SQL 案例：
+
+| 项目 | 内容 |
+|---|---|
+| 真实来源表 | `ext_prod_catalog.ods.ods_mkt_anhui_unit_status_d96_p_di`、`ext_prod_catalog.ods.ods_gen_anhui_max_gen_capability_df` |
+| 对应业务 | 查询某地区开机容量和在线机组数量 |
+
+```sql
+SELECT biz_time,
+       dt,
+       hm,
+       SUM(unit_capacity) AS online_capacity_mw,
+       COUNT(DISTINCT unit_name) AS online_unit_count
+FROM (
+  SELECT t1.biz_time,
+         t1.dt,
+         t1.hm,
+         t1.unit_name,
+         t3.unit_capacity
+  FROM ext_prod_catalog.ods.ods_mkt_anhui_unit_status_d96_p_di t1
+  LEFT JOIN ext_prod_catalog.ods.ods_gen_anhui_max_gen_capability_df t3
+    ON t1.unit_name = t3.trd_unit_name
+   AND SUBSTR(t1.dt, 1, 7) = t3.dt
+  WHERE t1.unit_status = '开机'
+    AND t1.dt >= '2025-09-01'
+) t
+GROUP BY biz_time, dt, hm
+ORDER BY biz_time;
+```
+
+映射到本设计后，查询目标为 `pm_{region_code}_unit_status_curve`。正式构造数据中建议提前完成机组实体映射，避免在业务查询 SQL 中写复杂字符串匹配逻辑。
+
+可选表证据状态：
+
+| 可选表 | 当前真实 SQL 证据 | 处理方式 |
+|---|---|---|
+| `pm_{region_code}_clearing_summary_curve` | 当前材料未提供可复用 SQL | 保留表名，待补出清汇总真实样例后再细化字段 |
+| `pm_{region_code}_interface_flow_curve` | 客户问题中出现断面阻塞，但当前材料未提供断面潮流 SQL | 保留为断面阻塞业务扩展表 |
+| `pm_{region_code}_market_event` | 当前材料未提供事件表 SQL | 保留为复盘和异常归因扩展表 |
+| `pm_{region_code}_node_power_forecast_curve` | 当前材料未提供节点预测 SQL | 保留为节点级预测扩展表 |
+
+## 6. 支撑管理表设计
+
+本章支撑管理表用于自然语言路由、指标映射、公式映射、表注册、文件暂存和人工校验，不直接对应真实市场业务源表。因此，真实来源表和 SQL 查询案例主要附在第 5 章业务表之后；支撑表由系统按 Agent 运行需要自行构造和维护。
+
+### 6.1 `pm_region`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `region_code` | varchar(20) | R01、R02、R03 |
+| `province_display_name` | varchar(100) | 虚构省份名，如海川省 |
+| `region_aliases` | text | 自然语言别名，如海川、海川省、海川市场 |
+| `table_prefix` | varchar(50) | 物理表名前缀，如 `pm_r02_` |
+| `is_active` | boolean | 是否启用 |
+| `remark` | text | 说明 |
+
+`pm_region` 是自然语言到物理表的关键映射表。用户可以问“海川省日前价格”，Agent 先从 `pm_region` 识别出 `region_code='R02'` 和 `table_prefix='pm_r02_'`，再路由到 `pm_r02_price_curve`。真实省份映射不进入公开库。如果确实需要，只放私有配置。
+
+### 6.2 `pm_data_version`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `data_version_code` | varchar(100) | 版本编码，如 `DEMO_SYNTH_V1` |
+| `version_name` | varchar(100) | 版本名 |
+| `date_start` | date | 数据起始日期 |
+| `date_end` | date | 数据结束日期 |
+| `generation_method` | text | 构造规则说明 |
+| `version_status` | varchar(30) | active、archived |
+
+### 6.3 `pm_time_point_dict`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `granularity_code` | varchar(20) | D96、D48、D24 |
+| `time_point` | int | 点位 |
+| `hm` | varchar(10) | 时刻 |
+| `start_time` | time | 开始时间 |
+| `end_time` | time | 结束时间 |
+| `minutes_per_point` | int | 每个点位分钟数 |
+
+### 6.4 `pm_metric_dict`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `metric_code` | varchar(100) | 指标编码 |
+| `metric_name` | varchar(100) | 指标名 |
+| `business_domain` | varchar(50) | price、price_spread、load、generation_output、boundary |
+| `target_table_pattern` | varchar(100) | 表模板 |
+| `target_value_field` | varchar(100) | 指标值字段 |
+| `filter_field` | varchar(100) | 过滤字段 |
+| `filter_value` | varchar(100) | 过滤值 |
+| `filter_condition` | text | 多条件过滤表达式，如 `market_stage='day_ahead' AND data_scenario='actual'` |
+| `formula_code` | varchar(100) | 公式编码，可为空 |
+| `granularity_code` | varchar(20) | D96、D48、D24 |
+| `result_display_type` | varchar(50) | single_value、curve、table、chart |
+| `aliases` | text | 自然语言别名 |
+| `unit_name` | varchar(30) | 单位 |
+| `is_active` | boolean | 是否启用 |
+
+`pm_metric_dict` 至少要覆盖真实 SQL 案例里的以下映射：
+
+| 自然语言指标 | 目标表模板 | 主要映射 |
+|---|---|---|
+| 日前价格 | `pm_{region_code}_price_curve` | `market_stage='day_ahead'` |
+| 实时价格 | `pm_{region_code}_price_curve` | `market_stage='real_time'` |
+| 预测价格 | `pm_{region_code}_price_curve` | `data_scenario='forecast' AND is_latest_forecast=true` |
+| 实际价格 | `pm_{region_code}_price_curve` | `data_scenario='actual'` |
+| 边际价格 | `pm_{region_code}_price_curve` | `price_type='marginal_price'` |
+| 统一结算价 | `pm_{region_code}_price_curve` | `price_type='unified_price'` |
+| 日前实时价差 | `pm_{region_code}_price_spread_curve` | `spread_type='day_ahead_minus_real_time'` |
+| 竞价空间 | `pm_{region_code}_boundary_curve` | `target_value_field='bidding_space_mw'` + `formula_code` |
+
+### 6.5 `pm_metric_formula`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `formula_code` | varchar(100) | 公式编码 |
+| `formula_name` | varchar(200) | 公式名称 |
+| `business_domain` | varchar(50) | price_spread、boundary、quality |
+| `region_code` | varchar(20) | 地区编码；通用公式填 `ALL` |
+| `result_metric_code` | varchar(100) | 结果指标编码 |
+| `result_field` | varchar(100) | 结果字段，如 `bidding_space_mw` |
+| `formula_expression` | text | 可读公式表达式 |
+| `component_fields` | text | 参与计算的字段清单 |
+| `component_metric_codes` | text | 参与计算的指标编码清单 |
+| `example_question` | text | 示例问题 |
+| `is_active` | boolean | 是否启用 |
+
+真实 SQL 案例显示，不同地区竞价空间公式不同，因此不能只靠一个固定字段解释全部问题。建议至少配置以下公式：
+
+| 公式编码 | 公式表达式 |
+|---|---|
+| `bid_space_r01` | `sys_load_mw - hydro_ps_output_mw - tie_line_power_mw - renewable_output_mw - non_market_output_mw` |
+| `bid_space_r02` | `short_term_system_load_mw - receiving_power_mw - renewable_output_mw - fixed_output_mw` |
+| `bid_space_r03` | `direct_dispatch_load_mw - tie_line_power_mw - renewable_output_mw - test_unit_output_mw` |
+| `price_spread_da_rt` | `day_ahead_price_yuan_per_mwh - real_time_price_yuan_per_mwh` |
+
+### 6.6 `pm_table_catalog`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `table_name` | varchar(100) | 物理表名 |
+| `table_pattern` | varchar(100) | 表模板，如 `pm_{region_code}_price_curve` |
+| `region_code` | varchar(20) | 地区编码 |
+| `business_domain` | varchar(50) | 业务域 |
+| `table_role` | varchar(30) | business、support、derived、view |
+| `data_status` | varchar(30) | empty、sample_ready、ready |
+| `main_metrics` | text | 主要指标 |
+| `example_question` | text | 示例问题 |
+| `is_active` | boolean | 是否启用 |
+
+### 6.7 `pm_entity_dict`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `entity_code` | varchar(100) | 脱敏实体编码 |
+| `entity_name` | varchar(200) | 展示名 |
+| `entity_type` | varchar(50) | grid、unit、node、interface、plant |
+| `region_code` | varchar(20) | 地区编码 |
+| `fuel_type` | varchar(50) | 火电、风电、光伏、水电、抽蓄等 |
+| `rated_capacity_mw` | numeric(18,6) | 额定容量，可为空 |
+| `aliases` | text | 别名 |
+| `is_active` | boolean | 是否启用 |
+
+### 6.8 `pm_import_batch`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `import_batch_id` | bigint | 批次主键 |
+| `target_table_name` | varchar(100) | 目标表 |
+| `import_title` | varchar(200) | 导入说明 |
+| `file_name` | varchar(300) | 文件名 |
+| `file_type` | varchar(30) | xlsx、csv、docx、pdf |
+| `import_status` | varchar(30) | uploaded、parsed、validated、submitted、approved、rejected、published |
+| `created_by` | varchar(100) | 创建人 |
+| `created_at` | timestamp | 创建时间 |
+
+### 6.9 `pm_import_staging_row`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `staging_row_id` | bigint | 暂存行主键 |
+| `import_batch_id` | bigint | 导入批次 |
+| `row_no` | int | 原文件行号 |
+| `target_table_name` | varchar(100) | 目标表 |
+| `device_name` | varchar(200) | 设备名 |
+| `metric_code` | varchar(100) | 指标编码 |
+| `biz_date` | date | 日期 |
+| `hm` | varchar(10) | 时刻 |
+| `time_point` | int | 点位 |
+| `numeric_value` | numeric(18,6) | 数值 |
+| `unit_name` | varchar(30) | 单位 |
+| `text_value` | text | 文本值 |
+| `validation_status` | varchar(30) | pending、valid、invalid |
+| `error_message` | text | 错误说明 |
+
+## 7. 派生视图和派生表
+
+### 7.1 跨地区统一视图
+
+跨地区问题查统一视图，单地区问题查单地区表。
+
+| 视图 | 来源表 | 用途 |
+|---|---|---|
+| `v_all_price_curve` | 各地区价格表 | 跨地区价格对比 |
+| `v_all_price_spread_curve` | 各地区价差表 | 跨地区价差对比 |
+| `v_all_load_curve` | 各地区负荷表 | 跨地区负荷对比 |
+| `v_all_generation_output_curve` | 各地区出力表 | 跨地区新能源/出力对比 |
+| `v_all_boundary_curve` | 各地区边界表 | 跨地区边界条件对比 |
+
+视图可以输出 `region_code` 和 `province_display_name`，但不输出真实省份名。这样自然语言回答可以说“海川省”，SQL 和表名仍保持脱敏。
+
+### 7.2 派生表使用原则
+
+`pm_{region_code}_price_spread_curve` 已在第 5 章作为必建基础派生表设计，因为业务需求和真实 SQL 案例都把价差作为高频基础查询对象。其他派生表只有在能明显降低 SQL 难度、提高 Agent 稳定性时再建设。
+
+## 8. Benchmark 建设方式
+
+Benchmark 不进入业务数据库，使用外部 JSON/JSONL 黄金标准文件维护。
+
+### 8.1 第一批任务优先级
+
+| 任务类型 | 依赖表 | 是否适合第一批 |
+|---|---|---:|
+| 单点出力查询 | `pm_r02_generation_output_curve` | 是 |
+| 单点负荷查询 | `pm_r02_load_curve` | 是 |
+| 价格均值/最高/最低 | `pm_r01_price_curve` | 是 |
+| 边界条件查询 | `pm_r03_boundary_curve` | 是 |
+| 日前/实时价差 | `pm_r01_price_spread_curve` | 是 |
+| 出清汇总 | `pm_r03_clearing_summary_curve` | 后续 |
+| 断面约束归因 | `pm_r03_interface_flow_curve` | 后续 |
+| 机组状态归因 | `pm_r03_unit_status_curve` | 后续 |
+
+### 8.2 示例黄金任务
+
+```json
+{
+  "task": "查询2025-09-01 05:45 海川省风电预测出力是多少",
+  "step1": "从 pm_region 将“海川省”映射为 region_code='R02'、table_prefix='pm_r02_'",
+  "step2": "选择 pm_r02_generation_output_curve",
+  "step3": "过滤 energy_type='wind'、data_scenario='forecast'、日期和时刻",
+  "step4": "返回 output_mw",
+  "expected_sql": "SELECT output_mw FROM pm_r02_generation_output_curve WHERE data_version_code = 'DEMO_SYNTH_V1' AND biz_date = DATE '2025-09-01' AND hm = '05:45' AND energy_type = 'wind' AND data_scenario = 'forecast'",
+  "expected_answer": "按 DEMO_SYNTH_V1 固定构造数据返回"
+}
+```
+
+## 9. 建设顺序
+
+| 顺序 | 工作 | 产物 |
+|---:|---|---|
+| 1 | 建支撑管理表 | `pm_region`、`pm_data_version`、`pm_time_point_dict`、`pm_metric_dict`、`pm_metric_formula`、`pm_table_catalog`、`pm_entity_dict` |
+| 2 | 建 P0 基础业务表 | 价格、价差、负荷、出力、边界五类表 |
+| 3 | 生成 `DEMO_SYNTH_V1` 构造数据 | 固定日期范围、地区、点位、指标值 |
+| 4 | 注册表和指标映射 | Agent 可路由到正确表和字段 |
+| 5 | 生成第一批 benchmark | task、steps、expected_sql、expected_answer |
+| 6 | 扩展 P1 表 | 出清汇总、断面、机组状态、事件 |
+
+## 10. 最终结论
+
+当前项目不需要原始数据层，也不需要复杂分层。最合适的设计是：
+
+1. 直接建设一套关系型基础表环境，表名和真实省份映射脱敏。
+2. 基础业务表按 `pm_{region_code}_*` 地区模板构造，自然语言使用虚构省份名。
+3. 数据全部由 `DEMO_SYNTH_V1` 等版本化规则生成。
+4. 支撑管理表负责表注册、指标映射、公式映射、版本固定、文件入库和人工校验。
+5. 天气、合同、申报、结算账单、私有主体明细不进入第一阶段。
